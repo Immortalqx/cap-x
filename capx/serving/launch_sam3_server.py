@@ -3,6 +3,7 @@ import base64
 import functools
 import io
 import logging
+import os
 from typing import Any, List, Tuple
 
 import numpy as np
@@ -10,6 +11,7 @@ import torch
 import tyro
 import uvicorn
 from fastapi import FastAPI, HTTPException
+from huggingface_hub import hf_hub_download
 from PIL import Image
 from pydantic import BaseModel
 
@@ -237,6 +239,11 @@ def main(
     device: str = "cuda",
     port: int = 8114,
     host: str = "127.0.0.1",
+    # Default to the public HF mirror `1038lab/sam3` which re-uploads the
+    # official Meta SAM3 weights. The official `facebook/sam3` repo
+    # requires manual access approval and HF login; this mirror avoids
+    # that step while keeping the same checkpoint content.
+    checkpoint_repo_id: str | None = "1038lab/sam3",
 ):
     global _MODEL, _PROCESSOR, _DEVICE
 
@@ -254,10 +261,26 @@ def main(
             device_idx = int(device.split(":")[-1]) if ":" in device else 0
             torch.cuda.set_device(device_idx)
 
+    # Resolve checkpoint: explicit arg > env var > default HF load.
+    # Allows downloading weights from a third-party HF mirror
+    # (e.g. 1038lab/sam3) when the official repo requires access approval.
+    resolved_repo = checkpoint_repo_id or os.getenv("SAM3_CHECKPOINT_REPO_ID")
+    checkpoint_path = None
+    if resolved_repo is not None:
+        logger.info(f"Downloading SAM3 weights from HF repo: {resolved_repo}")
+        checkpoint_path = hf_hub_download(
+            repo_id=resolved_repo,
+            filename="sam3.pt",
+        )
+        logger.info(f"SAM3 weights cached at: {checkpoint_path}")
+
     logger.info("Loading SAM3 model...")
     try:
-        # Assuming build_sam3_image_model loads default checkpoint
-        _MODEL = build_sam3_image_model(enable_inst_interactivity=True)
+        _MODEL = build_sam3_image_model(
+            checkpoint_path=checkpoint_path,
+            load_from_HF=checkpoint_path is None,
+            enable_inst_interactivity=True,
+        )
     except Exception as e:
         logger.error(f"Error building SAM3 model: {e}")
         raise

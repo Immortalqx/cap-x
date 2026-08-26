@@ -122,6 +122,10 @@ class LaunchArgs:
     web_ui_port: int | None = None
     """Port for the web UI server (default 8200)."""
 
+    max_trial_attempts: int | None = None
+    """Max number of full trial attempts per trial on timeout. Defaults to
+    YAML value (or 3 if neither is set). Set to 1 for strict Pass@1."""
+
 
 # ---------------------------------------------------------------------------
 # Web UI

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from collections.abc import Callable
 from typing import Any
 
@@ -9,7 +11,7 @@ from scipy.spatial.transform import Rotation as SciRotation
 
 from capx.utils.serve_utils import post_with_retries
 
-DEFAULT_URL = "http://127.0.0.1:8116"
+DEFAULT_URL = os.environ.get("PYROKI_SERVICE_URL", "http://127.0.0.1:8116")
 
 
 def init_pyroki(

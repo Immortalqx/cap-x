@@ -10,7 +10,7 @@ import logging
 import multiprocessing
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -64,6 +64,9 @@ class TrialSummary:
     num_regenerations: int = 0
     num_finishes: int = 0
     num_code_blocks: int = 0
+    # Per-trial audit metadata for LLM requests. Captures role, latency,
+    # token counts, status_code. The api key is never stored here.
+    model_requests: list[dict] = field(default_factory=list)
 
 
 def run_server_proc(api_cfg) -> multiprocessing.Process:
@@ -108,11 +111,17 @@ def _load_config(args: LaunchArgs) -> tuple[Any, dict[str, Any], list]:
         "visual_differencing_model": "google/gemini-3.1-pro-preview",
         "visual_differencing_model_server_url": "http://127.0.0.1:8110/chat/completions",
         "visual_differencing_model_api_key": None,
+        # Model/temperature/max_tokens sentinel defaults from LaunchArgs.
+        # If the user didn't pass --model/--temperature/--max-tokens,
+        # args.<field> will equal these values; YAML can then override.
+        "model": "google/gemini-3.1-pro-preview",
+        "temperature": 1.0,
+        "max_tokens": 20480,
     }
-    for field, cli_default in _CLI_DEFAULTS.items():
-        current_value = getattr(args, field, cli_default)
-        if current_value == cli_default and field in configs_dict:
-            setattr(args, field, configs_dict[field])
+    for fld, cli_default in _CLI_DEFAULTS.items():
+        current_value = getattr(args, fld, cli_default)
+        if current_value == cli_default and fld in configs_dict:
+            setattr(args, fld, configs_dict[fld])
 
     # Build merged config dict (CLI args override YAML)
     merged_config = {
@@ -157,7 +166,21 @@ def _load_config(args: LaunchArgs) -> tuple[Any, dict[str, Any], list]:
         if getattr(args, "web_ui_port", None) is not None
         else configs_dict.get("web_ui_port", 8200),
         "save_multiturn_prompts": configs_dict.get("save_multiturn_prompts", False),
+        # Max number of full trial attempts (timeout retry). YAML value
+        # is authoritative when set; CLI overrides it.
+        "max_trial_attempts": configs_dict.get("max_trial_attempts", 3),
     }
+
+    # CLI max_trial_attempts overrides YAML when explicitly provided.
+    cli_max_attempts = getattr(args, "max_trial_attempts", None)
+    if cli_max_attempts is not None:
+        if cli_max_attempts < 1:
+            raise ValueError(
+                f"--max-trial-attempts must be >= 1 (got {cli_max_attempts})"
+            )
+        merged_config["max_trial_attempts"] = cli_max_attempts
+    elif merged_config["max_trial_attempts"] is None or merged_config["max_trial_attempts"] < 1:
+        merged_config["max_trial_attempts"] = 3
 
     return env_factory, merged_config, api_servers
 
@@ -171,6 +194,11 @@ def _extract_code(content: str) -> list[str]:
     Returns:
         Extracted Python code list
     """
+    # MiniMax may wrap code in <execute>...</execute> tags; strip before
+    # fenced-block parsing so the wrapper does not end up inside the code.
+    if isinstance(content, str):
+        content = content.replace("<execute>", "").replace("</execute>", "")
+
     fence_start = "```python\n"
     fence_end = "```"
     start_idx = 0
@@ -386,6 +414,7 @@ def _save_trial_artifacts(
     visual_feedback_imgs: list[Image.Image],
     ensemble_data: dict[str, str] | None = None,
     multiturn_ensemble_data: list[dict[str, str]] | None = None,
+    model_requests: list[dict] | None = None,
 ) -> str | None:
     """Save trial artifacts (code, logs, images) to the output directory.
 
@@ -409,6 +438,16 @@ def _save_trial_artifacts(
 
     (trial_dir / "all_responses.json").write_text(json.dumps(all_responses, indent=2))
     (trial_dir / "summary.txt").write_text("\n".join(log_lines))
+
+    if model_requests is not None:
+        # Persist audit metadata for LLM requests. Sanitise to never
+        # contain the api key even if a caller passes it.
+        safe_requests = []
+        for r in model_requests:
+            safe_requests.append({k: v for k, v in r.items() if k != "api_key"})
+        (trial_dir / "model_requests.json").write_text(
+            json.dumps(safe_requests, indent=2)
+        )
 
     # Save initial ensemble data if provided
     if ensemble_data:
@@ -474,10 +513,16 @@ def _print_and_save_summary(
     # Compute statistics
     success_count = 0
     task_completed_count = 0
+    task_and_code_count = 0  # both task_completed and code success
     total_reward = 0.0
     total_code_blocks = 0
     total_regenerations = 0
     total_finishes = 0
+    total_requests = 0
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
+    total_cached_tokens = 0
+    total_request_latency = 0.0
     executed_trials = len(summaries)
 
     for summary in summaries:
@@ -486,20 +531,38 @@ def _print_and_save_summary(
             print(f"Code saved to {summary.code_path}")
         success_count += int(summary.success)
         total_reward += summary.reward
-        task_completed_count += int(summary.task_completed is not None and summary.task_completed)
+        task_completed = bool(summary.task_completed)
+        task_completed_count += int(task_completed)
+        if summary.success and task_completed:
+            task_and_code_count += 1
         total_code_blocks += summary.num_code_blocks
         total_regenerations += summary.num_regenerations
         total_finishes += summary.num_finishes
+        # Aggregate audit metadata from per-trial LLM requests.
+        for req in summary.model_requests or []:
+            total_requests += 1
+            total_prompt_tokens += int(req.get("prompt_tokens") or 0)
+            total_completion_tokens += int(req.get("completion_tokens") or 0)
+            total_cached_tokens += int(req.get("cached_tokens") or 0)
+            total_request_latency += float(req.get("latency_seconds") or 0.0)
 
     if executed_trials == 0:
         print("No trials completed.")
         return
 
     success_rate = success_count / executed_trials
+    task_success_rate = task_completed_count / executed_trials
+    conditional_task_rate = (
+        task_and_code_count / success_count if success_count > 0 else 0.0
+    )
     average_reward = total_reward / executed_trials
     average_code_blocks = total_code_blocks / executed_trials
     average_regenerations = total_regenerations / executed_trials
     average_finishes = total_finishes / executed_trials
+    avg_prompt_tokens = total_prompt_tokens / executed_trials
+    avg_completion_tokens = total_completion_tokens / executed_trials
+    avg_cached_tokens = total_cached_tokens / executed_trials
+    avg_latency = total_request_latency / total_requests if total_requests > 0 else 0.0
 
     # Retrieve Git info
     import subprocess
@@ -534,16 +597,25 @@ def _print_and_save_summary(
     print(f"Git Commit: {git_commit} (Dirty: {is_dirty})")
     print(f"Total number of trials: {executed_trials}")
     print(
-        f"Code generation success rate / Average reward / Task completed: \n{success_rate:.3f}/{average_reward:.3f}/{task_completed_count}"
+        f"Code execution success rate: {success_rate:.3f}"
     )
+    print(f"Task success rate: {task_success_rate:.3f}")
+    print(f"Conditional task success rate: {conditional_task_rate:.3f}")
+    print(f"Average reward: {average_reward:.3f}")
     print(f"Average code blocks: {average_code_blocks:.3f}")
     print(f"Average regenerations: {average_regenerations:.3f}")
     print(f"Average finishes: {average_finishes:.3f}")
+    print(f"Total model requests: {total_requests}")
+    print(f"Avg prompt tokens / trial: {avg_prompt_tokens:.1f}")
+    print(f"Avg completion tokens / trial: {avg_completion_tokens:.1f}")
+    print(f"Avg cached tokens / trial: {avg_cached_tokens:.1f}")
+    print(f"Avg request latency: {avg_latency:.2f} s")
     print(f"Elapsed time: {elapsed_time:.2f} seconds")
 
     # Write summaries to a txt file
     if config["output_dir"]:
-        with open(Path(config["output_dir"]) / "summaries.txt", "w") as f:
+        out_dir = Path(config["output_dir"])
+        with open(out_dir / "summaries.txt", "w") as f:
             f.write(f"Model: {args.model}\n")
             f.write(f"Visual Differencing Model: {args.visual_differencing_model}\n") if config[
                 "use_img_differencing"
@@ -551,10 +623,57 @@ def _print_and_save_summary(
             f.write(f"Config Path: {args.config_path}\n")
             f.write(f"Git Commit: {git_commit} (Dirty: {is_dirty})\n")
             f.write(f"Total number of trials: {executed_trials}\n")
-            f.write(
-                f"Code generation success rate / Average reward / Task completed: \n{success_rate:.3f}/{average_reward:.3f}/{task_completed_count}\n"
-            )
+            f.write(f"Code execution success rate: {success_rate:.3f}\n")
+            f.write(f"Task success rate: {task_success_rate:.3f}\n")
+            f.write(f"Conditional task success rate: {conditional_task_rate:.3f}\n")
+            f.write(f"Average reward: {average_reward:.3f}\n")
             f.write(f"Average code blocks: {average_code_blocks:.3f}\n")
             f.write(f"Average regenerations: {average_regenerations:.3f}\n")
             f.write(f"Average finishes: {average_finishes:.3f}\n")
+            f.write(f"Total model requests: {total_requests}\n")
+            f.write(f"Average prompt tokens / trial: {avg_prompt_tokens:.1f}\n")
+            f.write(f"Average completion tokens / trial: {avg_completion_tokens:.1f}\n")
+            f.write(f"Average cached tokens / trial: {avg_cached_tokens:.1f}\n")
+            f.write(f"Average request latency: {avg_latency:.2f} s\n")
             f.write(f"Elapsed time: {elapsed_time:.2f} seconds\n")
+
+        # Machine-readable metrics.json (no API keys; safe to share).
+        metrics = {
+            "schema_version": 1,
+            "model": args.model,
+            "config_path": args.config_path,
+            "num_trials": executed_trials,
+            "code_success_count": success_count,
+            "code_success_rate": success_rate,
+            "task_success_count": task_completed_count,
+            "task_success_rate": task_success_rate,
+            "task_and_code_success_count": task_and_code_count,
+            "conditional_task_success_rate": conditional_task_rate,
+            "average_reward": average_reward,
+            "average_code_blocks": average_code_blocks,
+            "average_regenerations": average_regenerations,
+            "average_finishes": average_finishes,
+            "model_requests": total_requests,
+            "prompt_tokens": total_prompt_tokens,
+            "completion_tokens": total_completion_tokens,
+            "cached_tokens": total_cached_tokens,
+            "model_request_latency_seconds": total_request_latency,
+            "elapsed_seconds": elapsed_time,
+            "trials": [
+                {
+                    "trial": s.trial,
+                    "sandbox_rc": s.sandbox_rc,
+                    "code_execution_success": bool(s.success),
+                    "reward": s.reward,
+                    "task_completed": bool(s.task_completed)
+                    if s.task_completed is not None
+                    else False,
+                    "truncated": bool(s.truncated),
+                    "num_code_blocks": s.num_code_blocks,
+                    "num_regenerations": s.num_regenerations,
+                    "num_finishes": s.num_finishes,
+                }
+                for s in summaries
+            ],
+        }
+        (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))

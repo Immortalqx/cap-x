@@ -42,6 +42,8 @@ VLM_MODELS = [
     "deepseek/deepseek-r1",
     "qwen/qwen3.5-122b-a10b",
     "moonshotai/kimi-k2",
+    # MiniMax M3 — VLM-capable, used for both code and visual differencing.
+    "MiniMax-M3",
 ]
 CLAUDE_MODELS = ["anthropic/claude-opus-4-5", "anthropic/claude-haiku-4-5"]
 OSS_MODELS = [
@@ -64,6 +66,57 @@ OPENROUTER_MODELS = [
     "openrouter/qwen/qwen3-235b-a22b",
 ]
 OPENROUTER_SERVER_URL = "http://localhost:8110/chat/completions"
+
+# ---------------------------------------------------------------------------
+# MiniMax (MiniMax-M3) — direct OpenAI-compatible API
+# ---------------------------------------------------------------------------
+
+MINIMAX_MODELS = ["MiniMax-M3"]
+MINIMAX_DEFAULT_BASE_URL = "https://api.minimax.io/v1"
+
+# Roles that benefit from disabled thinking (clean visual descriptions).
+MINIMAX_VDM_ROLES = {
+    "initial_scene_vdm",
+    "post_action_vdm",
+    "video_differencing",
+}
+
+# Roles where code/decision reasoning should be split from content.
+MINIMAX_CODE_ROLES = {
+    "initial_code",
+    "finish_regenerate",
+}
+
+
+def is_minimax_model(model: str) -> bool:
+    """Return True if `model` should be queried against MiniMax directly."""
+    return model in MINIMAX_MODELS
+
+
+def strip_execute_wrappers(content: str) -> str:
+    """Remove <execute>...</execute> wrappers that MiniMax may emit around code."""
+    if not isinstance(content, str):
+        return content
+    return (
+        content.replace("<execute>", "")
+        .replace("</execute>", "")
+    )
+
+
+def _resolve_minimax_api_key(args) -> str:
+    """Resolve API key for MiniMax. Raises if missing.
+
+    Order:
+      1. args.api_key (CLI/YAML explicit)
+      2. MINIMAX_API_KEY env var
+    """
+    key = args.api_key or os.getenv("MINIMAX_API_KEY")
+    if not key:
+        raise RuntimeError(
+            "MiniMax-M3 requires MINIMAX_API_KEY env var or explicit api_key arg."
+        )
+    return key
+
 
 # ---------------------------------------------------------------------------
 # Ensemble configuration
@@ -177,12 +230,21 @@ def _completions_to_responses_convert_prompt(prompt: list[dict]) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
-def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> str:
+def query_model(
+    args: "LaunchArgs | ModelQueryArgs",
+    prompt: list[dict],
+    request_role: str | None = None,
+    request_metadata: list[dict] | None = None,
+) -> str:
     """Query vLLM server for code generation.
 
     Args:
         args: Configuration with server URL and model settings
         prompt: Full prompt containing environment observation and possibly multi-turn decision prompt
+        request_role: One of "initial_code", "initial_scene_vdm", "post_action_vdm",
+            "video_differencing", "finish_regenerate". Used for MiniMax thinking mode.
+        request_metadata: Optional list to which a dict with latency/token metadata
+            is appended for auditing (api_key is never stored).
     Returns:
         Model response content
     """
@@ -193,7 +255,22 @@ def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> str:
     else:
         server_url = args.server_url
 
-    if args.model in GPT_MODELS:
+    if is_minimax_model(args.model):
+        api_key = _resolve_minimax_api_key(args)
+        payload = {
+            "model": args.model,
+            "messages": prompt,
+            "temperature": args.temperature,
+            "max_completion_tokens": args.max_tokens,
+            "thinking": {
+                "type": "disabled"
+                if (request_role in MINIMAX_VDM_ROLES)
+                else "adaptive"
+            },
+        }
+        if request_role not in MINIMAX_VDM_ROLES:
+            payload["reasoning_split"] = True
+    elif args.model in GPT_MODELS:
         if "codex" in args.model:
             prompt = _completions_to_responses_convert_prompt(prompt)
             payload = {
@@ -237,29 +314,70 @@ def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> str:
             "messages": prompt,
         }
     headers = {"Content-Type": "application/json"}
-    if args.api_key:
+    if is_minimax_model(args.model):
+        headers["Authorization"] = f"Bearer {api_key}"
+    elif args.api_key:
         headers["Authorization"] = f"Bearer {args.api_key}"
     elif os.getenv("OPENAI_API_KEY") is not None and args.model in GPT_MODELS:
         headers["Authorization"] = f"Bearer {os.getenv('OPENAI_API_KEY')}"
     start_time = time.time()
 
-    # keep calling until it works
+    # Retry only on transient HTTP errors; 429 (rate limit) is NOT retried.
     response = requests.post(
         server_url, headers=headers, data=json.dumps(payload), timeout=200
     )
-    retry = 1
-    while response.status_code in [404, 500, 502, 503, 504]:
-        sleep_time = 240 + random.uniform(-90, 90)
-        print(f"Retry {retry}. Model query failed with status code {response.status_code}. Error: {response.text}. Retrying in {sleep_time} seconds...")
-        time.sleep(sleep_time)
-        response = requests.post(
-            server_url, headers=headers, data=json.dumps(payload), timeout=200
-        )
-        retry += 1
+    attempts = 1
+    if is_minimax_model(args.model):
+        # MiniMax: bounded retry on 5xx (max 3 total attempts including the first).
+        while attempts < 3 and response.status_code in [500, 502, 503, 504]:
+            sleep_time = 10 + random.uniform(0, 5)
+            print(
+                f"[MiniMax] Retry {attempts}. status={response.status_code}. "
+                f"sleeping {sleep_time:.1f}s."
+            )
+            time.sleep(sleep_time)
+            response = requests.post(
+                server_url, headers=headers, data=json.dumps(payload), timeout=200
+            )
+            attempts += 1
+    else:
+        # Original upstream behaviour: heavy retry on 404/5xx with long backoff.
+        retry = 1
+        while response.status_code in [404, 500, 502, 503, 504]:
+            sleep_time = 240 + random.uniform(-90, 90)
+            print(f"Retry {retry}. Model query failed with status code {response.status_code}. Error: {response.text}. Retrying in {sleep_time} seconds...")
+            time.sleep(sleep_time)
+            response = requests.post(
+                server_url, headers=headers, data=json.dumps(payload), timeout=200
+            )
+            retry += 1
+            attempts = retry
 
     end_time = time.time()
-    print(f"Time taken to query model: {end_time - start_time:.2f} seconds")
-    response.raise_for_status()
+    latency = end_time - start_time
+    print(f"Time taken to query model: {latency:.2f} seconds")
+
+    # Build audit metadata (NEVER include the API key)
+    if request_metadata is not None:
+        meta: dict[str, Any] = {
+            "role": request_role,
+            "model": args.model,
+            "server_url": server_url,
+            "status_code": response.status_code,
+            "attempts": attempts,
+            "latency_seconds": latency,
+        }
+        if is_minimax_model(args.model):
+            meta["thinking_mode"] = payload["thinking"]["type"]
+            meta["reasoning_split"] = payload.get("reasoning_split", False)
+
+    if response.status_code >= 400:
+        # Record failure metadata before raising so callers see status_code.
+        if request_metadata is not None:
+            meta["usage"] = None
+            request_metadata.append(meta)
+        response.raise_for_status()
+
     body = response.json()
     out = {}
     if args.debug:
@@ -268,13 +386,50 @@ def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> str:
         if args.model in GPT_MODELS and "codex" in args.model:
             out["content"] = body["output_text"]
         else:
-            out["content"] = body["choices"][0]["message"]["content"]
+            msg = body["choices"][0]["message"]
+            content = msg.get("content")
+            # MiniMax M3 in adaptive-thinking mode can return an empty
+            # `content` field with the actual answer living in
+            # `reasoning_content`.  Only fall back to reasoning_content
+            # for the multi-turn decision role (finish_regenerate),
+            # where we only need a REGENERATE/FINISH keyword.
+            # For initial_code the content field is the executable
+            # Python program itself; using reasoning_content as a code
+            # body produces SyntaxError.
+            if content is None or content == "":
+                if request_role == "finish_regenerate":
+                    content = msg.get("reasoning_content") or ""
+                else:
+                    content = ""
+            out["content"] = content
     except (KeyError, IndexError) as exc:
         raise RuntimeError(f"Unexpected response format: {body}") from exc
     if body.get("choices") is not None:
-        out["reasoning"] = body.get("choices")[0].get("message").get("reasoning", None)
+        msg = body.get("choices")[0].get("message", {})
+        out["reasoning"] = msg.get("reasoning", None)
+        # MiniMax-specific: also capture reasoning_content / reasoning_details
+        out["reasoning_content"] = msg.get("reasoning_content", None)
+        out["reasoning_details"] = msg.get("reasoning_details", None)
     else:
         out["reasoning"] = None
+        out["reasoning_content"] = None
+        out["reasoning_details"] = None
+
+    # MiniMax cleanup: strip <execute> wrappers for code/decision roles only.
+    if is_minimax_model(args.model) and request_role in MINIMAX_CODE_ROLES:
+        out["content"] = strip_execute_wrappers(out["content"])
+
+    # Finalise metadata with usage info.
+    if request_metadata is not None:
+        usage = body.get("usage") or {}
+        meta["usage"] = usage
+        meta["prompt_tokens"] = usage.get("prompt_tokens")
+        meta["completion_tokens"] = usage.get("completion_tokens")
+        meta["total_tokens"] = usage.get("total_tokens")
+        ptd = usage.get("prompt_tokens_details") or {}
+        meta["cached_tokens"] = ptd.get("cached_tokens")
+        request_metadata.append(meta)
+
     return out  # type: ignore[return-value]
 
 

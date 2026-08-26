@@ -29,7 +29,10 @@ from capx.envs.tasks.base import CodeExecutionEnvBase
 
 from capx.llm.client import (
     VLM_MODELS,
+    MINIMAX_CODE_ROLES,
+    MINIMAX_VDM_ROLES,
     ModelQueryArgs,
+    is_minimax_model,
     query_model as _query_model,
     query_model_ensemble as _query_model_ensemble,
     query_single_model_ensemble as _query_single_model_ensemble,
@@ -217,6 +220,7 @@ def _capture_initial_visual_feedback(
     config: dict[str, Any],
     args: LaunchArgs,
     visual_differencing_args: ModelQueryArgs,
+    model_requests: list[dict] | None = None,
 ) -> tuple[list, list[str], str]:
     """Capture the initial environment image and optionally describe it.
 
@@ -280,6 +284,7 @@ def _capture_initial_visual_feedback(
         description = _describe_initial_scene(
             visual_differencing_args, task_description, initial_base64,
             wrist_image_base64=initial_wrist_base64,
+            request_metadata=model_requests,
         )
         feedback = f"The initial state of the environment is described as follows:\n{description}"
         obs["full_prompt"][-1]["content"][0]["text"] += f"\n\n{feedback}"
@@ -294,6 +299,7 @@ def _describe_initial_scene(
     task_description: str,
     image_base64: str,
     wrist_image_base64: str | None = None,
+    request_metadata: list[dict] | None = None,
 ) -> str:
     """Query a VLM to describe the initial environment state."""
     user_content: list[dict[str, Any]] = [
@@ -326,7 +332,12 @@ def _describe_initial_scene(
         },
         {"role": "user", "content": user_content},
     ]
-    return _query_model(visual_differencing_args, prompt)["content"]
+    return _query_model(
+        visual_differencing_args,
+        prompt,
+        request_role="initial_scene_vdm",
+        request_metadata=request_metadata,
+    )["content"]
 
 
 def _get_visual_differencing_feedback(
@@ -334,6 +345,7 @@ def _get_visual_differencing_feedback(
     task_description: str,
     visual_feedback_base64_history: list[str],
     wrist_base64_history: list[str] | None = None,
+    request_metadata: list[dict] | None = None,
 ) -> str | None:
     """Query a VLM to describe what changed between the two most recent frames.
 
@@ -383,7 +395,12 @@ def _get_visual_differencing_feedback(
         },
         {"role": "user", "content": user_content},
     ]
-    return _query_model(visual_differencing_args, prompt)["content"]
+    return _query_model(
+        visual_differencing_args,
+        prompt,
+        request_role="post_action_vdm",
+        request_metadata=request_metadata,
+    )["content"]
 
 
 # ---------------------------------------------------------------------------
@@ -395,6 +412,7 @@ def _get_video_differencing_feedback(
     task_description: str,
     turn_frames: list[np.ndarray],
     wrist_turn_frames: list[np.ndarray] | None = None,
+    request_metadata: list[dict] | None = None,
 ) -> str | None:
     """Query a VLM with a video of the turn execution to describe what happened.
 
@@ -459,7 +477,12 @@ def _get_video_differencing_feedback(
         },
         {"role": "user", "content": user_content},
     ]
-    return _query_model(visual_differencing_args, prompt)["content"]
+    return _query_model(
+        visual_differencing_args,
+        prompt,
+        request_role="video_differencing",
+        request_metadata=request_metadata,
+    )["content"]
 
 
 # ---------------------------------------------------------------------------
@@ -470,6 +493,7 @@ def _query_initial_code(
     args: LaunchArgs,
     config: dict[str, Any],
     obs: dict[str, Any],
+    model_requests: list[dict] | None = None,
 ) -> tuple[str, str | None, dict | None]:
     """Query the model for the initial code generation.
 
@@ -493,7 +517,12 @@ def _query_initial_code(
             "ensemble_synthesis_txt": out["ensemble_synthesis_txt"],
         }
     else:
-        out = _query_model(args, obs["full_prompt"])
+        out = _query_model(
+            args,
+            obs["full_prompt"],
+            request_role="initial_code",
+            request_metadata=model_requests,
+        )
 
     return out["content"], out["reasoning"], ensemble_data
 
@@ -519,6 +548,7 @@ def _handle_multi_turn_step(
     turn_frames: list[np.ndarray] | None = None,
     wrist_turn_frames: list[np.ndarray] | None = None,
     wrist_base64_history: list[str] | None = None,
+    model_requests: list[dict] | None = None,
 ) -> tuple[str, str | None, str | None, dict | None, list | None]:
     """Execute one multi-turn decision step.
 
@@ -572,6 +602,7 @@ def _handle_multi_turn_step(
         # Video-based differencing: pass video of this turn to VDM
         differencing_feedback = _get_video_differencing_feedback(
             visual_differencing_args, task_description, turn_frames, wrist_turn_frames,
+            request_metadata=model_requests,
         )
         is_video_feedback = True
     elif config["use_img_differencing"] and len(visual_feedback_base64_history) >= 2:
@@ -579,6 +610,7 @@ def _handle_multi_turn_step(
         differencing_feedback = _get_visual_differencing_feedback(
             visual_differencing_args, task_description, visual_feedback_base64_history,
             wrist_base64_history=wrist_base64_history,
+            request_metadata=model_requests,
         )
 
     # Only pass visual feedback to prompt if visual_feedback is enabled
@@ -614,7 +646,12 @@ def _handle_multi_turn_step(
             "ensemble_synthesis_txt": content.get("ensemble_synthesis_txt", ""),
         }
     else:
-        content = _query_model(args, decision_prompt)
+        content = _query_model(
+            args,
+            decision_prompt,
+            request_role="finish_regenerate",
+            request_metadata=model_requests,
+        )
 
     reasoning = content["reasoning"]
     decision, new_code = _parse_multi_turn_decision(content["content"])
@@ -679,6 +716,10 @@ def _run_single_trial(
     ensemble_data = None
     multiturn_ensemble_data: list[dict[str, Any]] = []
 
+    # Per-trial audit metadata for LLM requests. Populated by every
+    # _query_model call (initial_code, VDM, finish_regenerate).
+    model_requests: list[dict[str, Any]] = []
+
     # Per-turn frame tracking (for video differencing and per-turn video saving)
     turn_frame_ranges: list[tuple[int, int]] = []
 
@@ -702,7 +743,10 @@ def _run_single_trial(
 
     # --- 2. Capture initial visual feedback ---
     visual_feedback_imgs, visual_feedback_base64_history, task_description = (
-        _capture_initial_visual_feedback(env, obs, config, args, visual_differencing_args)
+        _capture_initial_visual_feedback(
+            env, obs, config, args, visual_differencing_args,
+            model_requests=model_requests,
+        )
     )
 
     # Seed wrist base64 history with initial wrist image
@@ -725,7 +769,9 @@ def _run_single_trial(
         reasoning = None
         ensemble_data = None
     else:
-        raw_code, reasoning, ensemble_data = _query_initial_code(args, config, obs)
+        raw_code, reasoning, ensemble_data = _query_initial_code(
+            args, config, obs, model_requests=model_requests,
+        )
 
     # Initialize partial artifacts for timeout recovery
     if partial_artifacts is not None:
@@ -824,6 +870,7 @@ def _run_single_trial(
                 turn_frames=turn_frames,
                 wrist_turn_frames=wrist_turn_frames,
                 wrist_base64_history=wrist_base64_history,
+                model_requests=model_requests,
             )
 
             if mt_ensemble is not None:
@@ -873,6 +920,7 @@ def _run_single_trial(
             info_step.get("task_completed", False), final_code, raw_code,
             all_responses, ["-" * 100, "Generated program:", final_code],
             visual_feedback_imgs,
+            model_requests=model_requests,
         )
 
         # Only save intermediate video if NOT doing per-turn saving
@@ -912,6 +960,7 @@ def _run_single_trial(
         all_responses, log_lines, visual_feedback_imgs,
         ensemble_data=ensemble_data,
         multiturn_ensemble_data=multiturn_ensemble_data,
+        model_requests=model_requests,
     )
 
     # Save per-turn and combined videos
@@ -956,6 +1005,7 @@ def _run_single_trial(
         num_regenerations=num_regenerations,
         num_finishes=num_finishes,
         num_code_blocks=num_code_blocks,
+        model_requests=model_requests,
     )
 
 

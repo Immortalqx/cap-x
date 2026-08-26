@@ -104,13 +104,23 @@ def _setup_output_dir(args, config: dict[str, Any]) -> None:
 
     Inserts the model name into the output path so that results from
     different models are stored separately.
+
+    If the caller already encoded the model name as the second-to-last
+    path component (e.g. ``<base>/<model_name>/v1``), we respect that
+    and skip the insertion to avoid double-prefixing.
     """
     if args.use_oracle_code:
         args.model = "oracle"
     if config["output_dir"]:
         parts = config["output_dir"].split("/")
-        parts.insert(-1, str(args.model).replace("/", "_"))
-        new_out_dir = "/".join(parts)
+        model_dir = str(args.model).replace("/", "_")
+        # Skip insertion if model_dir is already the second-to-last component
+        # (i.e. user has pre-formatted the path with the model name).
+        if len(parts) >= 2 and parts[-2] == model_dir:
+            new_out_dir = "/".join(parts)
+        else:
+            parts.insert(-1, model_dir)
+            new_out_dir = "/".join(parts)
         Path(new_out_dir).mkdir(parents=True, exist_ok=True)
         config["output_dir"] = new_out_dir
 
@@ -199,10 +209,11 @@ def _run_trial_with_retries(
     config: dict[str, Any],
     multi_turn_prompt: str | None,
 ) -> TrialSummary:
-    """Attempt a trial up to MAX_TRIAL_RETRIES times, retrying on timeout."""
-    for attempt in range(MAX_TRIAL_RETRIES):
+    """Attempt a trial up to `config["max_trial_attempts"]` times, retrying on timeout."""
+    max_attempts = int(config.get("max_trial_attempts", MAX_TRIAL_RETRIES))
+    for attempt in range(max_attempts):
         try:
-            is_last_attempt = attempt == MAX_TRIAL_RETRIES - 1
+            is_last_attempt = attempt == max_attempts - 1
             return _run_single_trial_with_timeout(
                 env=env,
                 trial=trial,
@@ -213,7 +224,7 @@ def _run_trial_with_retries(
                 raise_on_timeout=not is_last_attempt,
             )
         except TimeoutError:
-            print(f"Trial {trial} timed out (attempt {attempt + 1}/{MAX_TRIAL_RETRIES}). Retrying...")
+            print(f"Trial {trial} timed out (attempt {attempt + 1}/{max_attempts}). Retrying...")
 
     # All retries exhausted
     return TrialSummary(
@@ -223,7 +234,7 @@ def _run_trial_with_retries(
         terminated=False,
         truncated=True,
         sandbox_rc=1,
-        log=f"Trial {trial} failed after {MAX_TRIAL_RETRIES} timeout retries",
+        log=f"Trial {trial} failed after {max_attempts} timeout retries",
         task_completed=False,
         code_path=None,
         num_regenerations=0,

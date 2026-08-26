@@ -1,0 +1,100 @@
+# CaP-X + MiniMax-M3 config — Cube Lift (single trial smoke friendly)
+#
+# Usage:
+#   cd /home/lqx/Project/CodeAsPolicy/repos/cap-x
+#   source /media/SSD0/lqx/conda/etc/profile.d/conda.sh && conda activate cap-x
+#   export MUJOCO_GL=egl
+#   export HF_HOME=/home/lqx/Project/CodeAsPolicy/weights/hf_cache
+#   export MINIMAX_API_KEY=$(grep MINIMAX_API_KEY /home/lqx/Project/CodeAsPolicy/.env | cut -d= -f2-)
+#
+#   python -m capx.envs.launch \
+#       --config-path env_configs/cube_lifting/franka_robosuite_cube_lifting_minimax_m3.yaml \
+#       --total-trials 1 --num-workers 1 --record-video True
+
+env:
+  _target_: capx.envs.tasks.franka.franka_lift.FrankaLiftCodeEnv
+  cfg:
+    _target_: capx.envs.tasks.base.CodeExecEnvConfig
+    low_level: franka_robosuite_cube_lift_low_level
+    privileged: false
+    apis:
+      - FrankaControlApiReducedSkillLibrary
+    prompt: |
+      You are controlling a Franka Emika robot with API described below.
+      Goal: pick up the red cube and lift it.
+      You may write python code comments for reasoning but ONLY write the executable Python code and do not write it in code fences.
+      After this code executes, you will receive the current console stdout and stderr (any errors or print statements made in the code). You will then have the chance to write new code to query the environment state and/or complete the task.
+      The functions (APIs) below are already imported to the environment. If you want to use numpy, you need to import it explicitly.
+
+    multi_turn_prompt: |
+      The following code blocks were just executed:
+      ```python
+      {executed_code}
+      ```
+      The current console stdout is:
+      ```
+      {console_stdout}
+      ```
+      The current console stderr is:
+      ```
+      {console_stderr}
+      ```
+      If there were no errors during compilation or execution, the console stderr will be empty. If there were errors, consider regenerating the code.
+      Consider querying the environment state through perception-based tool calls and prints to see if the task is completed.
+      Please respond with EXACTLY ONE of the following:
+      - The word 'REGENERATE' followed immediately by new Python code in a fenced code block (```python...```) if you want to modify the code.
+      - The word 'FINISH' if the task appears to be complete
+
+# ─── API servers (perception stack) ─────────────────────────────────────
+# SAM3: object segmentation. Weights auto-downloaded from HF mirror
+# `1038lab/sam3` on first start (HF_HOME controls cache location).
+# To skip SAM3 and use GT state, see `franka_robosuite_cube_lifting_privileged.yaml`.
+api_servers:
+  - _target_: capx.serving.launch_sam3_server.main
+    device: cuda
+    port: 8114
+    host: 127.0.0.1
+    checkpoint_repo_id: 1038lab/sam3
+
+  - _target_: capx.serving.launch_contact_graspnet_server.main
+    port: 8115
+    host: 127.0.0.1
+
+  - _target_: capx.serving.launch_pyroki_server.main
+    port: 8116
+    host: 127.0.0.1
+    robot: panda_description
+    target_link: panda_hand
+
+# ─── LLM config: MiniMax M3 (OpenAI-compatible) ────────────────────────
+# Direct endpoint; do NOT use the OpenRouter proxy.
+# CLI defaults from capx/envs/launch.py are overridden by these values
+# via the _load_config YAML merge in capx/utils/launch_utils.py.
+model: MiniMax-M3
+server_url: https://api.minimax.io/v1/chat/completions
+
+# VDM uses the same model but with `thinking: disabled` for clean
+# visual descriptions; see client.MINI*_ROLES.
+visual_differencing_model: MiniMax-M3
+visual_differencing_model_server_url: https://api.minimax.io/v1/chat/completions
+
+temperature: 1.0
+max_tokens: 8192
+
+# ─── Eval behaviour ────────────────────────────────────────────────────
+record_video: true
+use_visual_feedback: false
+use_img_differencing: true
+use_video_differencing: false
+use_wrist_camera: false
+use_parallel_ensemble: false
+use_multimodel: false
+save_multiturn_prompts: true
+
+# Strict Pass@1: each seed gets at most 1 full trial attempt.
+# Bump to 3 only for stability debugging.
+max_trial_attempts: 1
+
+trials: 1
+num_workers: 1
+output_dir: ./outputs/MiniMax-M3/cube_lift
