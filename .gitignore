@@ -47,3 +47,4 @@ wandb/
 *.ico
 *.webp
 check.md
+weights/
