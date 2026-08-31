@@ -392,6 +392,35 @@ def test_parse_multi_turn_decision_uses_strict_protocol():
     assert _parse_multi_turn_decision(direct) == ("finish", direct)
 
 
+def test_parse_multi_turn_decision_accepts_direct_python_when_enabled():
+    from capx.utils.launch_utils import _parse_multi_turn_decision
+
+    fenced = "```python\nprint('continue')\n```"
+    assert _parse_multi_turn_decision(
+        fenced, allow_direct_python=True
+    ) == ("regenerate", "print('continue')")
+
+    raw = "print('raw continuation')"
+    assert _parse_multi_turn_decision(
+        raw, allow_direct_python=True
+    ) == ("regenerate", raw)
+
+    wrapped = "I will adjust the policy.\n<write_code>\nprint('wrapped')\n</write_code>"
+    assert _parse_multi_turn_decision(
+        wrapped, allow_direct_python=True
+    ) == ("regenerate", "print('wrapped')")
+
+    assert _parse_multi_turn_decision(
+        "FINISH", allow_direct_python=True
+    ) == ("finish", "FINISH")
+    assert _parse_multi_turn_decision(
+        "The robot should move again.", allow_direct_python=True
+    ) == ("finish", "The robot should move again.")
+    assert _parse_multi_turn_decision(
+        "", allow_direct_python=True
+    ) == ("finish", "")
+
+
 def test_multi_turn_prompt_accumulates_full_conversation_history():
     from copy import deepcopy
 

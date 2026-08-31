@@ -71,6 +71,8 @@ use_wrist_camera: false
 use_legacy_multi_turn_decision_prompt: false
 use_parallel_ensemble: false
 use_multimodel: false
+save_multiturn_prompts: true
+allow_direct_python_regeneration: true
 
 model: MiniMax-M3
 server_url: https://api.minimax.io/v1/chat/completions

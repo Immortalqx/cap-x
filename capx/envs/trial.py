@@ -666,7 +666,10 @@ def _handle_multi_turn_step(
         })
 
     reasoning = content["reasoning"]
-    decision, new_code = _parse_multi_turn_decision(content["content"])
+    decision, new_code = _parse_multi_turn_decision(
+        content["content"],
+        allow_direct_python=config.get("allow_direct_python_regeneration", False),
+    )
 
     return (
         decision,

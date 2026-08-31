@@ -9,6 +9,7 @@ import json
 import logging
 import multiprocessing
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -166,6 +167,9 @@ def _load_config(args: LaunchArgs) -> tuple[Any, dict[str, Any], list]:
         if getattr(args, "web_ui_port", None) is not None
         else configs_dict.get("web_ui_port", 8200),
         "save_multiturn_prompts": configs_dict.get("save_multiturn_prompts", False),
+        "allow_direct_python_regeneration": configs_dict.get(
+            "allow_direct_python_regeneration", False
+        ),
         # Max number of full trial attempts (timeout retry). YAML value
         # is authoritative when set; CLI overrides it.
         "max_trial_attempts": configs_dict.get("max_trial_attempts", 3),
@@ -194,9 +198,16 @@ def _extract_code(content: str) -> list[str]:
     Returns:
         Extracted Python code list
     """
-    # MiniMax may wrap code in <execute>...</execute> tags; strip before
-    # fenced-block parsing so the wrapper does not end up inside the code.
+    # MiniMax may wrap code in provider-specific tags. Prefer the explicit
+    # write_code body, then strip execute wrappers before fenced parsing.
     if isinstance(content, str):
+        write_code_match = re.search(
+            r"<write_code>\s*(.*?)\s*</write_code>",
+            content,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        if write_code_match is not None:
+            content = write_code_match.group(1)
         content = content.replace("<execute>", "").replace("</execute>", "")
 
     fence_start = "```python\n"
@@ -345,7 +356,11 @@ def _build_multi_turn_decision_prompt(
     return multi_turn_decision_prompt
 
 
-def _parse_multi_turn_decision(content: str) -> tuple[str, str | None]:
+def _parse_multi_turn_decision(
+    content: str,
+    *,
+    allow_direct_python: bool = False,
+) -> tuple[str, str | None]:
     """Parses the multi-turn decision response from the model
 
     Args:
@@ -356,6 +371,21 @@ def _parse_multi_turn_decision(content: str) -> tuple[str, str | None]:
     """
     if content is not None and ("REGENERATE" in content):
         return "regenerate", content.split("REGENERATE")[1].strip()
+
+    if allow_direct_python and isinstance(content, str) and content.strip():
+        first_line = content.strip().splitlines()[0].strip()
+        if first_line == "FINISH":
+            return "finish", content
+
+        extracted = _extract_code(content)[0]
+        if extracted:
+            try:
+                compile(extracted, "<minimax-multi-turn>", "exec")
+            except SyntaxError:
+                pass
+            else:
+                return "regenerate", extracted
+
     return "finish", content
 
 
