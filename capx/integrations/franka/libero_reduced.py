@@ -186,7 +186,7 @@ class FrankaLiberoApiReduced(ApiBase):
 
         Example:
             >>> rgb = obs["agentview"]["images"]["rgb"]
-            >>> masks = segment_sam3(rgb, text_prompt="red mug")
+            >>> masks = segment_sam3_text_prompt(rgb, "red mug")
         """
         results = self.sam3_seg_fn(rgb, text_prompt=text_prompt)
         if len(results) == 0:
@@ -272,12 +272,12 @@ class FrankaLiberoApiReduced(ApiBase):
         Example:
             >>> cam = obs["agentview"]
             >>> rgb = cam["images"]["rgb"]
-            >>> depth = cam["images"]["depth"][:, :, 0]
-            >>> sam3_results = sam3_seg_fn(rgb, text_prompt="red mug")
+            >>> depth = cam["images"]["depth"]
+            >>> sam3_results = segment_sam3_text_prompt(rgb, "red mug")
             >>> best = max(sam3_results, key=lambda d: d["score"])
             >>> mask = best["mask"]
             >>> K = cam["intrinsics"]
-            >>> grasp_sample_tf, grasp_scores = plan_grasp(
+            >>> grasp_poses, grasp_scores = plan_grasp(
             ...     depth=depth,
             ...     intrinsics=K,
             ...     segmentation=mask,

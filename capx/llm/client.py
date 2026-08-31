@@ -370,6 +370,18 @@ def query_model(
         if is_minimax_model(args.model):
             meta["thinking_mode"] = payload["thinking"]["type"]
             meta["reasoning_split"] = payload.get("reasoning_split", False)
+        meta["message_count"] = len(prompt)
+        meta["message_roles"] = [message.get("role") for message in prompt]
+        meta["image_count"] = sum(
+            1
+            for message in prompt
+            for item in (
+                message.get("content", [])
+                if isinstance(message.get("content"), list)
+                else []
+            )
+            if isinstance(item, dict) and item.get("type") in {"image_url", "input_image"}
+        )
 
     if response.status_code >= 400:
         # Record failure metadata before raising so callers see status_code.

@@ -224,6 +224,7 @@ def _build_multi_turn_decision_prompt_legacy(
     visual_differencing_feedback: str | None = None,
     *,
     is_video_feedback: bool = False,
+    conversation_history: list[dict] | None = None,
 ) -> list[dict]:
     """Build the multi-turn decision prompt for the model.
 
@@ -237,7 +238,11 @@ def _build_multi_turn_decision_prompt_legacy(
     Returns:
         The multi-turn decision prompt as a list of dictionaries
     """
-    multi_turn_decision_prompt = copy.deepcopy(obs["full_prompt"])
+    multi_turn_decision_prompt = copy.deepcopy(
+        conversation_history if conversation_history is not None else obs["full_prompt"]
+    )
+    if conversation_history is not None:
+        multi_turn_decision_prompt.append({"role": "user", "content": []})
     # TODO: I think the order of the content is important, unsure if it should be before or after the complete_multi_turn_prompt
     multi_turn_decision_prompt[-1]["content"].append(
         {"type": "text", "text": complete_multi_turn_prompt}
@@ -283,6 +288,7 @@ def _build_multi_turn_decision_prompt(
     visual_differencing_feedback: str | None = None,
     *,
     is_video_feedback: bool = False,
+    conversation_history: list[dict] | None = None,
 ) -> list[dict]:
     """Build the multi-turn decision prompt for the model.
 
@@ -296,7 +302,11 @@ def _build_multi_turn_decision_prompt(
     Returns:
         The multi-turn decision prompt as a list of dictionaries
     """
-    multi_turn_decision_prompt = copy.deepcopy(obs["full_prompt"])
+    multi_turn_decision_prompt = copy.deepcopy(
+        conversation_history if conversation_history is not None else obs["full_prompt"]
+    )
+    if conversation_history is not None:
+        multi_turn_decision_prompt.append({"role": "user", "content": []})
     # TODO: I think the order of the content is important, unsure if it should be before or after the complete_multi_turn_prompt
     multi_turn_decision_prompt[-1]["content"].append(
         {"type": "text", "text": complete_multi_turn_prompt}
@@ -345,9 +355,8 @@ def _parse_multi_turn_decision(content: str) -> tuple[str, str | None]:
         A tuple containing the decision and the new code (if any)
     """
     if content is not None and ("REGENERATE" in content):
-        return "regenerate", content.split("REGENERATE")[1].strip()  # new code
-    else:
-        return "finish", content
+        return "regenerate", content.split("REGENERATE")[1].strip()
+    return "finish", content
 
 
 def _get_visual_feedback(
@@ -469,6 +478,26 @@ def _save_trial_artifacts(
                     entry["ensemble_synthesis_txt"]
                 )
 
+    def render_prompt(messages: list[dict]) -> str:
+        lines: list[str] = []
+        for message in messages:
+            lines.append(f"## {message.get('role', 'unknown')}")
+            content = message.get("content", "")
+            if isinstance(content, str):
+                lines.append(content)
+            else:
+                for item in content:
+                    if not isinstance(item, dict):
+                        lines.append(str(item))
+                    elif item.get("type") in {"text", "input_text"}:
+                        lines.append(str(item.get("text", "")))
+                    elif item.get("type") in {"image_url", "input_image"}:
+                        lines.append("[image attachment omitted from text transcript]")
+                    else:
+                        lines.append(str(item))
+            lines.append("")
+        return "\n".join(lines)
+
     i = 0
     (trial_dir / "prompts_and_responses").mkdir(parents=True, exist_ok=True)
     for response in all_responses:
@@ -478,18 +507,14 @@ def _save_trial_artifacts(
             (trial_dir / "prompts_and_responses" / "task_seg_prompt.txt").write_text(str(response["task_seg_prompt"]))
         if "initial_prompt" in response:
             try:
-                initial_prompt_content = response["initial_prompt"][-1]["content"][0]["text"]
-                if isinstance(initial_prompt_content, list):
-                    initial_prompt_content = "\n".join(map(str, initial_prompt_content))
-                (trial_dir / "prompts_and_responses" / "initial_prompt.txt").write_text(str(initial_prompt_content))
+                initial_prompt_content = render_prompt(response["initial_prompt"])
+                (trial_dir / "prompts_and_responses" / "initial_prompt.txt").write_text(initial_prompt_content)
             except Exception as e:
                 print(f"Error saving initial_prompt: {e}")
         if "multi_turn_prompt" in response and response["multi_turn_prompt"] is not None:
             try:
-                multi_turn_prompt_content = response["multi_turn_prompt"][-1]["content"][0]["text"]
-                if isinstance(multi_turn_prompt_content, list):
-                    multi_turn_prompt_content = "\n".join(map(str, multi_turn_prompt_content))
-                (trial_dir / "prompts_and_responses" / f"multi_turn_prompt_{i:02d}.txt").write_text(str(multi_turn_prompt_content))
+                multi_turn_prompt_content = render_prompt(response["multi_turn_prompt"])
+                (trial_dir / "prompts_and_responses" / f"multi_turn_prompt_{i:02d}.txt").write_text(multi_turn_prompt_content)
             except Exception as e:
                 print(f"Error saving multi_turn_prompt_{i}: {e}")
             i += 1

@@ -1,4 +1,8 @@
-# environment config with CaP-Agent0 settings
+# CaP-Bench++ LIBERO-PRO Agent0 baseline with direct MiniMax-M3 VLM input.
+# MiniMax is the only coding model. RGB frames are sent directly to it; no
+# 9-temperature ensemble, multimodel synthesis, or VDM image differencing is
+# used. Keep this file as the canonical default for local M3 smoke/benchmark
+# runs.
 # Usage:
 #   uv run capx/envs/launch.py --config-path env_configs/libero/franka_libero_cap_agent0.yaml
 
@@ -37,9 +41,10 @@ env:
       {console_stderr}
       ```
       If there were no errors during compilation or execution, the console stderr will be empty. If there were errors, consider regenerating the code.
+      IMPORTANT: The instruction to output bare Python without code fences applied only to the initial response. On this and every later turn, follow the decision format below exactly. If the task is not complete, further robot actions are needed, or an error needs correction, respond with REGENERATE. Do not output Python on a later turn unless it is preceded by REGENERATE.
       Please respond with EXACTLY ONE of the following:
       - The word 'REGENERATE' followed immediately by new Python code in a fenced code block (```python...```) if you want to modify the code.
-      - The word 'FINISH' if the task appears to be complete
+      - The word 'FINISH' only if the current observation indicates that the task is complete and no further action is needed
 
 api_servers:
   - _target_: capx.serving.launch_pyroki_server.main
@@ -59,9 +64,19 @@ api_servers:
 
 record_video: true
 output_dir: ./outputs/franka_libero_cap_agent0
-use_img_differencing: true
-use_parallel_ensemble: true
-use_multimodel: true
+use_visual_feedback: true
+use_img_differencing: false
+use_video_differencing: false
+use_wrist_camera: false
+use_legacy_multi_turn_decision_prompt: false
+use_parallel_ensemble: false
+use_multimodel: false
+
+model: MiniMax-M3
+server_url: https://api.minimax.io/v1/chat/completions
+temperature: 1.0
+max_tokens: 8192
+max_trial_attempts: 1
 
 trials: 50
 num_workers: 10

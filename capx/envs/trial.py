@@ -549,7 +549,8 @@ def _handle_multi_turn_step(
     wrist_turn_frames: list[np.ndarray] | None = None,
     wrist_base64_history: list[str] | None = None,
     model_requests: list[dict] | None = None,
-) -> tuple[str, str | None, str | None, dict | None, list | None]:
+    conversation_history: list[dict] | None = None,
+) -> tuple[str, str | None, str | None, dict | None, list | None, str]:
     """Execute one multi-turn decision step.
 
     Captures visual feedback, builds the decision prompt, queries the model,
@@ -567,7 +568,9 @@ def _handle_multi_turn_step(
     """
     use_wrist = config.get("use_wrist_camera", False)
 
-    executed_code = "\n".join(code_blocks[:code_block_idx])
+    # Earlier code and execution feedback are carried by conversation_history.
+    # This turn should report only the code block that was just executed.
+    executed_code = code_blocks[code_block_idx - 1]
     complete_multi_turn_prompt = multi_turn_prompt.format(
         executed_code=executed_code,
         console_stdout=info_step["stdout"],
@@ -625,11 +628,13 @@ def _handle_multi_turn_step(
         decision_prompt = _build_multi_turn_decision_prompt_legacy(
             obs, complete_multi_turn_prompt, visual_feedback_base64, differencing_feedback,
             is_video_feedback=is_video_feedback,
+            conversation_history=conversation_history,
         )
     else:
         decision_prompt = _build_multi_turn_decision_prompt(
             obs, complete_multi_turn_prompt, visual_feedback_base64, differencing_feedback,
             is_video_feedback=is_video_feedback,
+            conversation_history=conversation_history,
         )
 
     # Query model
@@ -653,10 +658,24 @@ def _handle_multi_turn_step(
             request_metadata=model_requests,
         )
 
+    if conversation_history is not None:
+        conversation_history[:] = copy.deepcopy(decision_prompt)
+        conversation_history.append({
+            "role": "assistant",
+            "content": [{"type": "text", "text": content["content"] or ""}],
+        })
+
     reasoning = content["reasoning"]
     decision, new_code = _parse_multi_turn_decision(content["content"])
 
-    return decision, new_code, reasoning, multiturn_ensemble_entry, decision_prompt
+    return (
+        decision,
+        new_code,
+        reasoning,
+        multiturn_ensemble_entry,
+        decision_prompt,
+        content["content"] or "",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -748,6 +767,9 @@ def _run_single_trial(
             model_requests=model_requests,
         )
     )
+    # MiniMax's chat-completions requests are stateless. Keep the complete
+    # system/user/assistant transcript locally and send it on every turn.
+    conversation_history = copy.deepcopy(obs["full_prompt"])
 
     # Seed wrist base64 history with initial wrist image
     if use_wrist and wrist_base64_history is not None and hasattr(env, "render_wrist"):
@@ -772,6 +794,11 @@ def _run_single_trial(
         raw_code, reasoning, ensemble_data = _query_initial_code(
             args, config, obs, model_requests=model_requests,
         )
+
+    conversation_history.append({
+        "role": "assistant",
+        "content": [{"type": "text", "text": raw_code or ""}],
+    })
 
     # Initialize partial artifacts for timeout recovery
     if partial_artifacts is not None:
@@ -862,7 +889,14 @@ def _run_single_trial(
                         frame_start, frame_end,
                     )
 
-            decision, new_code, mt_reasoning, mt_ensemble, decision_prompt = _handle_multi_turn_step(
+            (
+                decision,
+                new_code,
+                mt_reasoning,
+                mt_ensemble,
+                decision_prompt,
+                mt_raw_response,
+            ) = _handle_multi_turn_step(
                 env, obs, args, config, visual_differencing_args,
                 multi_turn_prompt, code_blocks, code_block_idx, info_step,
                 task_description, visual_feedback_imgs, visual_feedback_base64_history,
@@ -871,6 +905,7 @@ def _run_single_trial(
                 wrist_turn_frames=wrist_turn_frames,
                 wrist_base64_history=wrist_base64_history,
                 model_requests=model_requests,
+                conversation_history=conversation_history,
             )
 
             if mt_ensemble is not None:
@@ -885,6 +920,7 @@ def _run_single_trial(
                     "block_idx": [code_block_idx],
                     "code_blocks": new_blocks,
                     "decision": "regenerate",
+                    "raw_response": mt_raw_response,
                     "reasoning": mt_reasoning if mt_reasoning is not None else "",
                 })
                 del code_blocks[code_block_idx:]
@@ -901,7 +937,9 @@ def _run_single_trial(
 
             elif decision == "finish":
                 all_responses.append({
+                    "multi_turn_prompt": decision_prompt if config.get("save_multiturn_prompts", False) else None,
                     "decision": "finish",
+                    "raw_response": mt_raw_response,
                     "reasoning": mt_reasoning if mt_reasoning is not None else (new_code or ""),
                 })
                 print("Model chose to finish")
@@ -1024,3 +1062,7 @@ def _patch_libero_goal(env: CodeExecutionEnvBase, obs: dict[str, Any]) -> None:
                 libero_environment_goal=goal
             )
         )
+        # CodeExecutionEnvBase rebuilds full_prompt from this template after
+        # every code block. Persist the task-specific prompt so later model
+        # turns do not regress to the literal {libero_environment_goal} token.
+        env._full_prompt = copy.deepcopy(obs["full_prompt"])

@@ -158,6 +158,9 @@ def test_minimax_code_role_payload(monkeypatch):
     assert meta["status_code"] == 200
     assert meta["prompt_tokens"] == 10
     assert meta["completion_tokens"] == 5
+    assert meta["message_count"] == 1
+    assert meta["message_roles"] == ["user"]
+    assert meta["image_count"] == 0
     # api key never stored
     assert "sk-test" not in json.dumps(meta)
 
@@ -356,8 +359,161 @@ def test_yaml_merge_max_trial_attempts_validation():
         _load_config(args)
 
 
+def test_libero_multiturn_prompt_scopes_initial_output_rule():
+    import yaml
+
+    config_path = REPO_ROOT / "env_configs" / "libero" / "franka_libero_cap_agent0.yaml"
+    config = yaml.safe_load(config_path.read_text())
+    prompt = config["env"]["cfg"]["multi_turn_prompt"]
+
+    assert "bare Python without code fences applied only to the initial response" in prompt
+    assert "Do not output Python on a later turn unless it is preceded by REGENERATE" in prompt
+    assert "FINISH' only if" in prompt
+
+
 def test_extract_code_strips_execute_wrapper():
     from capx.utils.launch_utils import _extract_code
     content = "<execute>\n```python\nprint('x')\n```\n</execute>"
     blocks = _extract_code(content)
     assert blocks == ["print('x')"]
+
+
+def test_parse_multi_turn_decision_uses_strict_protocol():
+    from capx.utils.launch_utils import _parse_multi_turn_decision
+
+    assert _parse_multi_turn_decision("FINISH") == ("finish", "FINISH")
+    assert _parse_multi_turn_decision("") == ("finish", "")
+    prefixed = "REGENERATE\n```python\nprint('x')\n```"
+    assert _parse_multi_turn_decision(prefixed) == (
+        "regenerate",
+        "```python\nprint('x')\n```",
+    )
+    direct = "```python\nprint('continue')\n```"
+    assert _parse_multi_turn_decision(direct) == ("finish", direct)
+
+
+def test_multi_turn_prompt_accumulates_full_conversation_history():
+    from copy import deepcopy
+
+    from capx.utils.launch_utils import _build_multi_turn_decision_prompt
+
+    initial = [
+        {"role": "system", "content": "system"},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Goal: concrete goal\nAPIs: ..."},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,INITIAL"}},
+            ],
+        },
+        {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "print('first code')"}],
+        },
+    ]
+    turn_1 = _build_multi_turn_decision_prompt(
+        {"full_prompt": []},
+        "Executed: print('first code')\nstdout: first output\nstderr: first error",
+        "data:image/png;base64,TURN1",
+        conversation_history=initial,
+    )
+    history = deepcopy(turn_1)
+    history.append({
+        "role": "assistant",
+        "content": [{"type": "text", "text": "REGENERATE\nprint('second code')"}],
+    })
+    turn_2 = _build_multi_turn_decision_prompt(
+        {"full_prompt": []},
+        "Executed: print('second code')\nstdout: second output\nstderr: second error",
+        "data:image/png;base64,TURN2",
+        conversation_history=history,
+    )
+
+    assert [message["role"] for message in turn_2] == [
+        "system", "user", "assistant", "user", "assistant", "user",
+    ]
+    transcript = json.dumps(turn_2)
+    for expected in (
+        "Goal: concrete goal",
+        "INITIAL",
+        "first code",
+        "first output",
+        "first error",
+        "TURN1",
+        "second code",
+        "second output",
+        "second error",
+        "TURN2",
+    ):
+        assert expected in transcript
+
+
+def test_minimax_sends_accumulated_messages_unchanged(monkeypatch):
+    monkeypatch.setenv("MINIMAX_API_KEY", "sk-test")
+    captured = {}
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": [{"type": "text", "text": "Goal: concrete"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "first code"}]},
+        {"role": "user", "content": [{"type": "text", "text": "first stdout/error"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "REGENERATE second code"}]},
+        {"role": "user", "content": [{"type": "text", "text": "second stdout/error"}]},
+    ]
+
+    def fake_post(url, headers, data, timeout):
+        captured["payload"] = json.loads(data)
+        return _mock_response({
+            "choices": [{"message": {"role": "assistant", "content": "FINISH"}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 1, "total_tokens": 11},
+        })
+
+    with patch("capx.llm.client.requests.post", side_effect=fake_post):
+        args = ModelQueryArgs(
+            model="MiniMax-M3",
+            server_url="https://api.minimax.io/v1/chat/completions",
+        )
+        request_log = []
+        query_model(
+            args,
+            messages,
+            request_role="finish_regenerate",
+            request_metadata=request_log,
+        )
+
+    assert captured["payload"]["messages"] == messages
+    assert request_log[0]["message_count"] == 6
+    assert request_log[0]["message_roles"] == [
+        "system", "user", "assistant", "user", "assistant", "user",
+    ]
+
+
+def test_libero_goal_patch_persists_across_multi_turn_observations():
+    from copy import deepcopy
+    from types import SimpleNamespace
+
+    from capx.envs.trial import _patch_libero_goal
+
+    prompt = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Goal: {libero_environment_goal}"}
+            ],
+        }
+    ]
+    env = SimpleNamespace(
+        low_level_env=SimpleNamespace(
+            handle=SimpleNamespace(task_language="put the wine bottle on the cabinet")
+        ),
+        _full_prompt=deepcopy(prompt),
+    )
+    initial_obs = {"full_prompt": deepcopy(prompt)}
+
+    _patch_libero_goal(env, initial_obs)
+
+    assert initial_obs["full_prompt"][-1]["content"][0]["text"] == (
+        "Goal: put the wine bottle on the cabinet"
+    )
+    next_obs = {"full_prompt": deepcopy(env._full_prompt)}
+    assert "{libero_environment_goal}" not in str(next_obs["full_prompt"])
+    assert "put the wine bottle on the cabinet" in str(next_obs["full_prompt"])
