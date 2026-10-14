@@ -32,6 +32,7 @@ from capx.llm import (  # noqa: E402
     strip_execute_wrappers,
 )
 from capx.llm.client import (  # noqa: E402
+    MINIMAX_ALWAYS_THINKING_MODELS,
     MINIMAX_DEFAULT_BASE_URL as _DEFAULT_URL_FROM_CLIENT,
     ModelQueryArgs,
     _resolve_minimax_api_key,
@@ -43,7 +44,11 @@ from capx.llm.client import (  # noqa: E402
 # ---------------------------------------------------------------------------
 
 def test_minimax_models_constant():
-    assert MINIMAX_MODELS == ["MiniMax-M3"]
+    # Pin membership rather than the exact list: adding a model is how this
+    # module grows, and the ordering carries no meaning.
+    assert "MiniMax-M3" in MINIMAX_MODELS
+    assert "MiniMax-M3.1-Flash-Preview" in MINIMAX_MODELS
+    assert len(MINIMAX_MODELS) == len(set(MINIMAX_MODELS))
 
 
 def test_minimax_default_base_url():
@@ -195,6 +200,76 @@ def test_minimax_vdm_role_payload(monkeypatch):
     # image_url preserved as base64
     assert payload["messages"][0]["content"][1]["image_url"]["url"].startswith("data:image/png;base64,")
     assert out["content"] == "describe scene"
+
+
+# ---------------------------------------------------------------------------
+# MiniMax-M3.1-Flash-Preview: thinking cannot be switched off
+# ---------------------------------------------------------------------------
+
+def test_m31_code_role_payload_keeps_thinking_on(monkeypatch):
+    """M3.1 rejects thinking=disabled with HTTP 400, so code roles must send
+    adaptive thinking plus the caller's reasoning_effort."""
+    monkeypatch.setenv("MINIMAX_API_KEY", "sk-test")
+    captured = {}
+    def fake_post(url, headers, data, timeout):
+        captured["payload"] = json.loads(data)
+        return _mock_response({
+            "choices": [{"message": {"role": "assistant", "content": "print('hi')"}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+        })
+
+    with patch("capx.llm.client.requests.post", side_effect=fake_post):
+        args = ModelQueryArgs(model="MiniMax-M3.1-Flash-Preview",
+                              server_url="https://api.minimax.io/v1/chat/completions",
+                              max_tokens=65536, reasoning_effort="max")
+        query_model(args, [{"role": "user", "content": "hi"}],
+                    request_role="initial_code", request_metadata=[])
+
+    payload = captured["payload"]
+    assert payload["thinking"]["type"] == "adaptive"
+    assert payload["reasoning_effort"] == "max"
+    assert payload.get("reasoning_split") is True
+
+
+def test_m31_vdm_role_payload_bounds_effort_instead_of_disabling(monkeypatch):
+    """A VDM role must not disable thinking on M3.1 either. Low effort is the
+    supported way to keep the visual description clean."""
+    monkeypatch.setenv("MINIMAX_API_KEY", "sk-test")
+    captured = {}
+    def fake_post(url, headers, data, timeout):
+        captured["payload"] = json.loads(data)
+        return _mock_response({
+            "choices": [{"message": {"role": "assistant", "content": "describe scene"}}],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150},
+        })
+
+    with patch("capx.llm.client.requests.post", side_effect=fake_post):
+        args = ModelQueryArgs(model="MiniMax-M3.1-Flash-Preview",
+                              server_url="https://api.minimax.io/v1/chat/completions",
+                              max_tokens=65536, reasoning_effort="max")
+        query_model(args, [{"role": "user", "content": [
+            {"type": "text", "text": "describe"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}},
+        ]}], request_role="initial_scene_vdm", request_metadata=[])
+
+    payload = captured["payload"]
+    # The two constraints this guards against, both observed as HTTP 400:
+    assert payload["thinking"]["type"] != "disabled"
+    assert payload["thinking"]["type"] == "adaptive"
+    assert payload["reasoning_effort"] == "low"
+    # VDM roles never request a reasoning split, on any MiniMax model.
+    assert "reasoning_split" not in payload
+
+
+def test_m31_is_registered_as_always_thinking():
+    """Keep the model set and the special-case set in step.
+
+    A model that answers 400 to thinking=disabled has to appear in
+    MINIMAX_ALWAYS_THINKING_MODELS, or its VDM roles silently 400.
+    """
+    assert "MiniMax-M3.1-Flash-Preview" in MINIMAX_ALWAYS_THINKING_MODELS
+    assert MINIMAX_ALWAYS_THINKING_MODELS <= set(MINIMAX_MODELS)
+    assert "MiniMax-M3" not in MINIMAX_ALWAYS_THINKING_MODELS
 
 
 def test_strip_execute_wrappers_in_code_role(monkeypatch):
