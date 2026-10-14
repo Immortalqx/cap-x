@@ -28,10 +28,14 @@ try:
 
     register_env("two_arm_handover_robosuite", RobosuiteHandoverEnv)
     register_env("two_arm_lift_robosuite", RobosuiteTwoArmLiftEnv)
-except Exception:
-    import traceback
-    print("Robosuite not installed!")
-    traceback.print_exc()
+except Exception as exc:
+    # The two benchmark stacks are mutually exclusive by design (see the note
+    # above): the LIBERO environment deliberately ships a different robosuite
+    # fork, so this import is *expected* to fail there. Dumping a full traceback
+    # for that expected state reads like a crash and buries the LIBERO/R1Pro
+    # registration lines printed right after it. The reason on one line is still
+    # enough to tell "wrong environment" from "genuinely broken install".
+    print(f"Robosuite envs not registered: {type(exc).__name__}: {exc}")
 
 # NOTE: Can only have one of LIBERO or Robosuite installed at a time!
 # Using LIBERO run: uv sync --extra libero --extra contactgraspnet
