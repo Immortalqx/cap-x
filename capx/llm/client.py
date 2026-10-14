@@ -44,6 +44,9 @@ VLM_MODELS = [
     "moonshotai/kimi-k2",
     # MiniMax M3 — VLM-capable, used for both code and visual differencing.
     "MiniMax-M3",
+    # MiniMax M3.1 Flash Preview — the model this project pins. 1M context,
+    # multimodal, tunable thinking depth.
+    "MiniMax-M3.1-Flash-Preview",
 ]
 CLAUDE_MODELS = ["anthropic/claude-opus-4-5", "anthropic/claude-haiku-4-5"]
 OSS_MODELS = [
@@ -68,11 +71,18 @@ OPENROUTER_MODELS = [
 OPENROUTER_SERVER_URL = "http://localhost:8110/chat/completions"
 
 # ---------------------------------------------------------------------------
-# MiniMax (MiniMax-M3) — direct OpenAI-compatible API
+# MiniMax (MiniMax-M3 / MiniMax-M3.1-Flash-Preview) — direct OpenAI-compatible API
 # ---------------------------------------------------------------------------
 
-MINIMAX_MODELS = ["MiniMax-M3"]
+MINIMAX_MODELS = ["MiniMax-M3", "MiniMax-M3.1-Flash-Preview"]
 MINIMAX_DEFAULT_BASE_URL = "https://api.minimax.io/v1"
+
+#: Models that refuse a disabled thinking block.
+#: MiniMax-M3.1-Flash-Preview answers HTTP 400 with
+#: "requires adaptive thinking; thinking.type=\"disabled\" ... is not allowed".
+#: Thinking depth is bounded with ``reasoning_effort`` instead, which is the
+#: supported lever for that model.
+MINIMAX_ALWAYS_THINKING_MODELS = {"MiniMax-M3.1-Flash-Preview"}
 
 # Roles that benefit from disabled thinking (clean visual descriptions).
 MINIMAX_VDM_ROLES = {
@@ -113,7 +123,7 @@ def _resolve_minimax_api_key(args) -> str:
     key = args.api_key or os.getenv("MINIMAX_API_KEY")
     if not key:
         raise RuntimeError(
-            "MiniMax-M3 requires MINIMAX_API_KEY env var or explicit api_key arg."
+            f"{args.model} requires MINIMAX_API_KEY env var or explicit api_key arg."
         )
     return key
 
@@ -257,17 +267,28 @@ def query_model(
 
     if is_minimax_model(args.model):
         api_key = _resolve_minimax_api_key(args)
+        always_thinking = args.model in MINIMAX_ALWAYS_THINKING_MODELS
         payload = {
             "model": args.model,
             "messages": prompt,
             "temperature": args.temperature,
             "max_completion_tokens": args.max_tokens,
-            "thinking": {
+        }
+        if always_thinking:
+            # This model rejects a disabled thinking block, so the VDM roles
+            # get a low effort level instead of no thinking at all. Effort is
+            # the supported way to bound thinking depth here.
+            payload["thinking"] = {"type": "adaptive"}
+            if request_role in MINIMAX_VDM_ROLES:
+                payload["reasoning_effort"] = "low"
+            else:
+                payload["reasoning_effort"] = args.reasoning_effort
+        else:
+            payload["thinking"] = {
                 "type": "disabled"
                 if (request_role in MINIMAX_VDM_ROLES)
                 else "adaptive"
-            },
-        }
+            }
         if request_role not in MINIMAX_VDM_ROLES:
             payload["reasoning_split"] = True
     elif args.model in GPT_MODELS:
